@@ -30,7 +30,9 @@ struct reliable_state
 
     uint64_t window_size;
     uint64_t retransmission_timer;
-    uint32_t current_seq_num;
+    uint32_t current_seq_no;
+
+    uint32_t current_ack_no;
 
     buffer_node_t *send_unack;
     buffer_node_t *send_next;
@@ -77,12 +79,13 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss,
 
     r->window_size = cc->window;
     r->retransmission_timer = cc->timeout;
-    r->current_seq_num = 1;
+    r->current_seq_no = 1;
 
     r->send_next = r->send_buffer->head;
     r->send_unack = r->send_buffer->head;
 
     r->recv_next = r->rec_buffer->head;
+    r->current_ack_no = 1;
 
     return r;
 }
@@ -154,15 +157,35 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         data[i] = pkt->data[i];
     }
 
-    // If seqno >= RCV.NXT + RCV.WND then Drop packet
-    // else Store in the buffer if not already there
-
-    // If seqno == RCV.NXT:
-    // Set RCV.NXT to the highest seqno consecutively stored in the buffer + 1
+    // drop packet if out of window
+    if (seqno >= r->recv_next + r->window_size)
+    {
+        return;
+    }
+    // Store in the buffer if not already there
+    if (!buffer_contains(r->rec_buffer, seqno))
+    {
+        buffer_insert(r->rec_buffer, pkt, 0);
+    }
+    //set recv_next to highest seqno consecutively stored in the buffer + 1
+    if (seqno == r->recv_next)
+    {
+        int max_seqno = seqno;
+        buffer_node_t *current = r->recv_next->next;
+        while (current != NULL && current->packet.seqno == max_seqno + 1)
+        {
+            max_seqno = current->packet.seqno;
+            current = current->next;
+        }
+        r->recv_next = current;
+        r->current_ack_no = max_seqno;
+    }
 
     // Release data [seqno, RCV.NXT - 1] with rel_output()
+    rel_ouput(r);
 
     // Send back ACK with cumulative ackno = RCV.NXT
+    struct ack_packet *ack = {htons(0), htons(8), htonl(r->current_ack_no)};
 }
 
 void rel_read(rel_t *s)
@@ -217,9 +240,9 @@ void rel_read(rel_t *s)
         packet_t *p = {checksum, // already in network order
                        htons(maxSizeOfPacket),
                        htonl(0),
-                       htonl(s->current_seq_num),
+                       htonl(s->current_seq_no),
                        data};
-        s->current_seq_num++;
+        s->current_seq_no++;
         buffer_insert(s->send_buffer, p, 0);
         free(buf);
     }
@@ -235,9 +258,9 @@ void rel_read(rel_t *s)
         packet_t *p = {checksum, // already in network order
                        htons(extra_packet_size),
                        htonl(0),
-                       htonl(s->current_seq_num),
+                       htonl(s->current_seq_no),
                        data};
-        s->current_seq_num++;
+        s->current_seq_no++;
         buffer_insert(s->send_buffer, p, 0);
         free(buf);
     }
