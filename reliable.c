@@ -29,7 +29,11 @@ struct reliable_state
     buffer_t *rec_buffer;
 
     size_t window_size;
+    size_t retransmission_timer;
     size_t current_seq_num;
+
+    buffer_node_t *send_unack;
+    buffer_node_t *send_next;
 };
 rel_t *rel_list;
 
@@ -70,7 +74,11 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss,
     r->rec_buffer->head = NULL;
 
     r->window_size = cc->window;
+    r->retransmission_timer = cc->timeout;
     r->current_seq_num = 0;
+
+    r->send_next = r->send_buffer->head;
+    r->send_unack = r->send_buffer->head;
 
     return r;
 }
@@ -101,15 +109,26 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 void rel_read(rel_t *s)
 {
     size_t maxSizeOfPacket = 500;
-    size_t inputBufSize = 5000; // TODO how big ?
+    int inputBufSize = s->window_size - buffer_size(s->send_buffer); //TODO assumption: return value is in bytes
+
+    // check if buffer has enough cap for new packets
+    if (inputBufSize <= 0)
+    {
+        return;
+    }
 
     // read data from stdin in bytes
     void *buf = malloc(inputBufSize);
     int d = conn_input(s->c, buf, inputBufSize);
-    if (d == 0)
+    if (d == 0) // no data currently available
     {
         free(buf);
         return;
+    }
+    else if (d == -1) // read an EOF or error from input
+    {
+        free(buf);
+        rel_destroy(s);
     }
 
     // integer div to get how many packets we have
@@ -122,14 +141,7 @@ void rel_read(rel_t *s)
         extra_packet_size = d % maxSizeOfPacket;
     }
 
-    // check if buffer has enough cap for new packets
-    if (buffer_size(s->send_buffer) + number_packets > s->window_size)
-    {
-        free(buf);
-        return;
-    }
-
-    // split and prepend for each packet a header
+    // split and prepend for each packet a header and put into buffer
     unsigned char *ptr = buf;
     for (int i = 0; i < number_packets - 1; i++)
     {
@@ -138,17 +150,17 @@ void rel_read(rel_t *s)
         {
             data[j] = ptr[i * maxSizeOfPacket + j];
         }
-        packet_t *p = {0,
+        uint16_t checksum = cksum(*data, maxSizeOfPacket);
+        packet_t *p = {checksum,
                        maxSizeOfPacket,
                        0, // TODO ACK is 0 here ?
                        s->current_seq_num,
                        data};
         s->current_seq_num++;
-        // put packets in buffer
         buffer_insert(s->send_buffer, p, 0);
         free(buf);
     }
-    // same for extra packet
+    // same for extra packet (smaller than 500 b)
     if (extra_packet_size != 0)
     {
         char *data[extra_packet_size];
@@ -156,38 +168,39 @@ void rel_read(rel_t *s)
         {
             data[j] = ptr[(number_packets - 1) * maxSizeOfPacket + j];
         }
-        packet_t *p = {0,
+        uint16_t checksum = cksum(*data, extra_packet_size);
+        packet_t *p = {checksum,
                        extra_packet_size,
                        0,
                        s->current_seq_num,
                        data};
         s->current_seq_num++;
-        // put packets in buffer
         buffer_insert(s->send_buffer, p, 0);
         free(buf);
     }
 
-    //get first from buffer
-    buffer_node_t *node = buffer_get_first(s->send_buffer);
-    packet_t *packet = &node->packet;
-
-    // TODO introduce a new window_buf/pointers on send_buf
-    // bc now only one packet can be sent at any time
+    // check if window is at max size
+    if (s->send_next - s->send_unack >= s->window_size)
+    {
+        return;
+    }
 
     //get current time
     struct timeval now;
     gettimeofday(&now, NULL);
     long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
 
-    // send first packet
+    // send next packet
+    packet_t *packet = &s->send_next->packet;
     int e = conn_sendpkt(s, packet, packet->len);
     if (e == -1 || e != packet->len)
     {
         return; // TODO what else ?
     }
 
-    //set last retransmit of packet to now
-    node->last_retransmit = now_ms;
+    //set last retransmit of packet to now and update send_next
+    s->send_next->last_retransmit = now_ms;
+    s->send_next = s->send_next->next;
     return;
 }
 
@@ -203,7 +216,30 @@ void rel_timer()
     rel_t *current = rel_list;
     while (current != NULL)
     {
-        // ...
+        buffer_node_t *current_node = current->send_unack;
+        buffer_node_t *send_next = current->send_next;
+        size_t retransmission_timer = current->retransmission_timer;
+
+        //get current time
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+
+        // go over window
+        while (current_node != send_next)
+        {
+            if (now_ms - current_node->last_retransmit > retransmission_timer)
+            {
+                // retransmit packet
+                packet_t *packet = &current_node->packet;
+                int e = conn_sendpkt(current->c, packet, packet->len);
+                if (e == -1 || e != packet->len)
+                {
+                    return; // TODO what else ?
+                }
+            }
+            current_node = current_node->next;
+        }
         current = rel_list->next;
     }
 }
