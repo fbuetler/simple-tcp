@@ -341,7 +341,7 @@ void rel_output(rel_t *r)
     // check if bufspace is enough for taking next package
     // TODO is the buffersize check necessary again here ?
     size_t space = conn_bufspace(r->c);
-    size_t len = buffer_get_first(r->rec_buffer)->packet.len;
+    size_t len = ntohs(buffer_get_first(r->rec_buffer)->packet.len);
     if (space < len)
     {
         return;
