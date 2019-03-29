@@ -28,12 +28,14 @@ struct reliable_state
     // ...
     buffer_t *rec_buffer;
 
-    size_t window_size;
-    size_t retransmission_timer;
-    size_t current_seq_num;
+    uint64_t window_size;
+    uint64_t retransmission_timer;
+    uint32_t current_seq_num;
 
     buffer_node_t *send_unack;
     buffer_node_t *send_next;
+
+    buffer_node_t *recv_next;
 };
 rel_t *rel_list;
 
@@ -75,10 +77,12 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss,
 
     r->window_size = cc->window;
     r->retransmission_timer = cc->timeout;
-    r->current_seq_num = 0;
+    r->current_seq_num = 1;
 
     r->send_next = r->send_buffer->head;
     r->send_unack = r->send_buffer->head;
+
+    r->recv_next = r->rec_buffer->head;
 
     return r;
 }
@@ -103,13 +107,69 @@ void rel_destroy(rel_t *r)
 // n is the expected length of pkt
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 {
-    /* Your logic implementation here */
+    if (n != 8 && n < 12)
+    {
+        //oopsi
+        return;
+    }
+
+    uint16_t checksum = ltons(pkt->cksum);
+    uint16_t len = ltohs(pkt->len);
+    uint32_t ackno = ltohl(pkt->ackno);
+
+    //catch corrupted packets
+    if (len != checksum)
+    {
+        //oopsi
+        return;
+    }
+
+    // ACK packet
+    if (n == 8)
+    {
+        //check if expteced one
+        if (ackno == r->send_unack)
+        {
+            // slide window
+            r->send_unack = r->send_unack->next;
+            return;
+        }
+        // TODO store out of order ACKs?
+        return;
+    }
+
+    // end-of-file tranmission
+    if (n == 12)
+    {
+        //check if all receivec packets are written to stdout
+        // then rel_destroy()
+        return;
+    }
+
+    // normal data packet
+    uint32_t seqno = ltohl(pkt->seqno);
+    char *data[len - 12];
+    for (int i = 0; i < len - 12; i++)
+    {
+        data[i] = pkt->data[i];
+    }
+
+    // If seqno >= RCV.NXT + RCV.WND then Drop packet
+    // else Store in the buffer if not already there
+
+    // If seqno == RCV.NXT:
+    // Set RCV.NXT to the highest seqno consecutively stored in the buffer + 1
+
+    // Release data [seqno, RCV.NXT - 1] with rel_output()
+
+    // Send back ACK with cumulative ackno = RCV.NXT
 }
 
 void rel_read(rel_t *s)
 {
-    size_t maxSizeOfPacket = 500;
-    int inputBufSize = s->window_size - buffer_size(s->send_buffer); //TODO assumption: return value is in bytes
+    int maxSizeOfPacket = 500;
+    //TODO assumption: return value is in bytes
+    size_t inputBufSize = s->window_size - buffer_size(s->send_buffer);
 
     // check if buffer has enough cap for new packets
     if (inputBufSize <= 0)
@@ -125,7 +185,9 @@ void rel_read(rel_t *s)
         free(buf);
         return;
     }
-    else if (d == -1) // read an EOF or error from input
+    // read an EOF or error from input and ALL packets sent are acknowledged
+    // TODO add other termination constraints
+    else if (d == -1 && s->send_unack == s->send_next)
     {
         free(buf);
         rel_destroy(s);
@@ -133,8 +195,8 @@ void rel_read(rel_t *s)
 
     // integer div to get how many packets we have
     // check if remaining bytes with mod; possible small packet
-    size_t number_packets = d / maxSizeOfPacket;
-    size_t extra_packet_size = 0;
+    int number_packets = d / maxSizeOfPacket;
+    int extra_packet_size = 0;
     if (d % maxSizeOfPacket != 0)
     {
         number_packets++;
@@ -142,19 +204,20 @@ void rel_read(rel_t *s)
     }
 
     // split and prepend for each packet a header and put into buffer
+    // TODO ACK is 0 here ?
     unsigned char *ptr = buf;
     for (int i = 0; i < number_packets - 1; i++)
     {
-        char *data[maxSizeOfPacket];
+        char data[maxSizeOfPacket];
         for (int j = 0; j < maxSizeOfPacket; j++)
         {
             data[j] = ptr[i * maxSizeOfPacket + j];
         }
         uint16_t checksum = cksum(*data, maxSizeOfPacket);
-        packet_t *p = {checksum,
-                       maxSizeOfPacket,
-                       0, // TODO ACK is 0 here ?
-                       s->current_seq_num,
+        packet_t *p = {checksum, // already in network order
+                       htons(maxSizeOfPacket),
+                       htonl(0),
+                       htonl(s->current_seq_num),
                        data};
         s->current_seq_num++;
         buffer_insert(s->send_buffer, p, 0);
@@ -163,16 +226,16 @@ void rel_read(rel_t *s)
     // same for extra packet (smaller than 500 b)
     if (extra_packet_size != 0)
     {
-        char *data[extra_packet_size];
+        char data[extra_packet_size];
         for (int j = 0; j < extra_packet_size; j++)
         {
             data[j] = ptr[(number_packets - 1) * maxSizeOfPacket + j];
         }
         uint16_t checksum = cksum(*data, extra_packet_size);
-        packet_t *p = {checksum,
-                       extra_packet_size,
-                       0,
-                       s->current_seq_num,
+        packet_t *p = {checksum, // already in network order
+                       htons(extra_packet_size),
+                       htonl(0),
+                       htonl(s->current_seq_num),
                        data};
         s->current_seq_num++;
         buffer_insert(s->send_buffer, p, 0);
@@ -218,7 +281,7 @@ void rel_timer()
     {
         buffer_node_t *current_node = current->send_unack;
         buffer_node_t *send_next = current->send_next;
-        size_t retransmission_timer = current->retransmission_timer;
+        uint64_t retransmission_timer = current->retransmission_timer;
 
         //get current time
         struct timeval now;
