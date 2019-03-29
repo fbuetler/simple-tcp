@@ -127,7 +127,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         return;
     }
 
-    // ACK packet
+    // ACK PACKET
     if (n == 8)
     {
         //check if expteced one
@@ -149,7 +149,14 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         return;
     }
 
-    // normal data packet
+    // NORMAL DATA PACKET
+    // check if output_buf has space
+    if (len > conn_bufspace(r->c))
+    {
+        return;
+    }
+
+    // get seqno and extract data from packet
     uint32_t seqno = ltohl(pkt->seqno);
     char *data[len - 12];
     for (int i = 0; i < len - 12; i++)
@@ -292,7 +299,19 @@ void rel_read(rel_t *s)
 
 void rel_output(rel_t *r)
 {
-    /* Your logic implementation here */
+    // check if bufspace is enough for taking next package
+    size_t space = conn_bufspace(r->c);
+    size_t len = buffer_get_first(r->rec_buffer)->packet.len;
+    if (space < len)
+    {
+        return;
+    }
+
+    void *buf = malloc(len);
+    buf = (void *)buffer_get_first(r->rec_buffer)->packet.data;
+    int e = conn_output(r->c, buf, len);
+    free(buf);
+    return;
 }
 
 void rel_timer()
