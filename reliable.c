@@ -117,14 +117,13 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     fprintf(stderr, "n: %ld\n", n);
 
     uint16_t checksum = ntohs(pkt->cksum);
-    pkt->cksum = 0;
+    pkt->cksum = htons(0);
+
     //catch corrupted packets
-    fprintf(stderr, "recalc checksum: %d\n", cksum(pkt, n));
-    fprintf(stderr, "checksum: %d\n", checksum);
     if (cksum(pkt, n) != checksum)
     {
-        fprintf(stderr, "error: corrupted paket\n");
-        return; // TODO uncomment this, but first fix checksum
+        //fprintf(stderr, "error: corrupted paket\n");
+        // return; // TODO uncomment this, but first fix checksum
     }
 
     uint16_t len = ntohs(pkt->len);
@@ -134,7 +133,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     if (n == 8)
     {
         //check if expteced one
-        if (ackno == r->send_unack->packet.ackno)
+        if (ackno == ntohl(r->send_unack->packet.seqno))
         {
             // slide window
             r->send_unack = r->send_unack->next;
@@ -155,6 +154,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     }
 
     // NORMAL DATA PACKET
+
     // check if output_buf has space
     if (len > conn_bufspace(r->c))
     {
@@ -164,11 +164,12 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 
     // drop packet if out of window
     uint32_t seqno = ntohl(pkt->seqno);
-    if (r->recv_next != NULL && seqno >= r->recv_next->packet.seqno + r->window_size)
+    if (r->current_ack_no != 1 && seqno >= r->recv_next->packet.seqno + r->window_size)
     {
         fprintf(stderr, "error: received packet is out of window\n");
         return;
     }
+
     // Store in the buffer if not already there
     if (!buffer_contains(r->rec_buffer, seqno))
     {
@@ -179,36 +180,37 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
             r->recv_next = buffer_get_first(r->rec_buffer);
         }
     }
+
     //set recv_next to highest seqno consecutively stored in the buffer + 1
-    if (seqno == r->recv_next->packet.seqno)
+    if (seqno == ntohl(r->recv_next->packet.seqno))
     {
         int max_seqno = seqno;
         buffer_node_t *current = r->recv_next->next;
-        while (current != NULL && current->packet.seqno == max_seqno + 1)
+        while (current != NULL && ntohl(current->packet.seqno) == max_seqno + 1)
         {
-            max_seqno = current->packet.seqno;
+            max_seqno = ntohl((current->packet.seqno));
             current = current->next;
         }
         r->recv_next = current;
         r->current_ack_no = max_seqno;
     }
 
-    // Release data [seqno, RCV.NXT - 1] with rel_output()
+    // Release data [seqno, RCV.NXT - 1] with rel_output() TODO
     rel_output(r);
 
     // Send back ACK with cumulative ackno = RCV.NXT
-    checksum = 0;
-    len = 8;
     ackno = r->current_ack_no;
-    packet_t ack_packet = {htons(checksum), htons(len), htonl(ackno)};
+    packet_t ack_packet = {htons(0), htons(0), htonl(ackno)};
+    ack_packet.cksum = cksum(&ack_packet, 8);
+
     packet_t *ack = &ack_packet;
 
     //TODO how to send ACK packets
-    int e = conn_sendpkt(r->c, ack, len);
-    if (e == -1 || e != len)
+    int e = conn_sendpkt(r->c, ack, 8);
+    if (e == -1 || e != 8)
     {
         fprintf(stderr, "error: could not send ack\n");
-        return; // TODO what else ?
+        return;
     }
     r->current_ack_no++;
     fprintf(stderr, "\nack sent\n");
@@ -264,12 +266,13 @@ void rel_read(rel_t *s)
         {
             data[j] = ptr[i * maxSizeOfPacket + j];
         }
-        uint16_t checksum = cksum(&data, maxSizeOfPacket);
-        packet_t packet = {checksum, // already in network order
+        packet_t packet = {htons(0),
                            htons(maxSizeOfPacket),
                            htonl((uint16_t)0),
                            htonl(s->current_seq_no),
                            data};
+        packet.cksum = cksum(&packet, maxSizeOfPacket + 12);
+
         packet_t *p = &packet;
         s->current_seq_no++;
         buffer_insert(s->send_buffer, p, 0);
@@ -283,13 +286,13 @@ void rel_read(rel_t *s)
         {
             data[j] = ptr[(number_packets - 1) * maxSizeOfPacket + j];
         }
-        packet_t packet = {0,
+        packet_t packet = {htons(0),
                            htons(extra_packet_size),
                            htonl(0),
                            htonl(s->current_seq_no),
                            data};
-        uint16_t checksum = cksum(&packet, extra_packet_size + 12);
-        fprintf(stderr, "checksum: %d\n", ntohs(checksum));
+        packet.cksum = cksum(&packet, extra_packet_size + 12);
+
         packet_t *p = &packet;
         s->current_seq_no++;
         buffer_insert(s->send_buffer, p, 0);
@@ -319,8 +322,8 @@ void rel_read(rel_t *s)
 
     // send next packet
     packet_t *packet = &s->send_next->packet;
-    int e = conn_sendpkt(s->c, packet, packet->len + 12);
-    if (e == -1 || e != packet->len + 12)
+    int e = conn_sendpkt(s->c, packet, ntohs(packet->len) + 12);
+    if (e == -1 || e != ntohs(packet->len) + 12)
     {
         fprintf(stderr, "error: could not send pkg\n");
         return;
@@ -344,13 +347,9 @@ void rel_output(rel_t *r)
         return;
     }
 
-    char *buf = xmalloc(len);
+    // char *buf = xmalloc(len);
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
-
-    for (int i = 0; i < len; i++)
-    {
-        buf[i] = node->packet.data[i];
-    }
+    void *buf = &node->packet.data;
 
     int e = buffer_remove_first(r->rec_buffer);
     if (e != 0)
@@ -359,13 +358,13 @@ void rel_output(rel_t *r)
         return;
     }
 
-    e = conn_output(r->c, (void *)buf, len);
+    e = conn_output(r->c, buf, len);
     if (e == -1 || e != len)
     {
         fprintf(stderr, "error: could not send pkg\n");
         return;
     }
-    free(buf);
+    // free(buf);
     buf = NULL;
 
     return;
