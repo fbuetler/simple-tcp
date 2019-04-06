@@ -28,6 +28,7 @@ struct reliable_state
     // ...
     buffer_t *rec_buffer;
 
+    uint64_t window_max_size;
     uint64_t window_size;
     uint64_t retransmission_timer;
     uint32_t current_seq_no;
@@ -38,6 +39,9 @@ struct reliable_state
     buffer_node_t *send_next;
 
     buffer_node_t *recv_next;
+
+    int send_EOF;
+    int recv_EOF;
 };
 rel_t *rel_list;
 
@@ -76,7 +80,9 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_com
     r->rec_buffer = xmalloc(sizeof(buffer_t));
     r->rec_buffer->head = NULL;
 
-    r->window_size = cc->window;
+    r->window_max_size = cc->window;
+    r->window_size = 0;
+
     r->retransmission_timer = cc->timeout;
     r->current_seq_no = 1;
 
@@ -87,6 +93,14 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_com
     r->current_ack_no = 1;
 
     return r;
+}
+
+long getCurrentTime()
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+    return now_ms;
 }
 
 void rel_destroy(rel_t *r)
@@ -106,7 +120,7 @@ void rel_destroy(rel_t *r)
     // ...
 }
 
-// n is the expected length of pkt
+// n is the length of the pkt
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 {
     if (n != 8 && n < 12)
@@ -114,16 +128,16 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         fprintf(stderr, "error: impossible packet size\n");
         return;
     }
-    fprintf(stderr, "n: %ld\n", n);
+    fprintf(stderr, "info: n = %ld\n", n);
 
-    uint16_t checksum = ntohs(pkt->cksum);
+    uint16_t checksum = pkt->cksum;
     pkt->cksum = htons(0);
 
     //catch corrupted packets
     if (cksum(pkt, n) != checksum)
     {
-        //fprintf(stderr, "error: corrupted paket\n");
-        // return; // TODO uncomment this, but first fix checksum
+        fprintf(stderr, "error: corrupted paket\n");
+        return; // TODO uncomment this, but first fix checksum
     }
 
     uint16_t len = ntohs(pkt->len);
@@ -133,10 +147,12 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     if (n == 8)
     {
         //check if expteced one
-        if (ackno == ntohl(r->send_unack->packet.seqno))
+        if (ackno == r->current_ack_no)
         {
             // slide window
-            r->send_unack = r->send_unack->next;
+            r->window_size++;
+            r->current_ack_no++;
+            fprintf(stderr, "info: ack received\n");
             return;
         }
         // TODO store out of order ACKs?
@@ -147,9 +163,10 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     // end-of-file tranmission
     if (n == 12)
     {
+        r->recv_EOF = 1;
         //check if all receivec packets are written to stdout
         // then rel_destroy()
-        fprintf(stderr, "error: end of connection packet\n");
+        fprintf(stderr, "info: end of connection packet\n");
         return;
     }
 
@@ -213,126 +230,64 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         return;
     }
     r->current_ack_no++;
-    fprintf(stderr, "\nack sent\n");
+    fprintf(stderr, "info: ack sent\n");
 }
 
 void rel_read(rel_t *s)
 {
-    uint16_t maxSizeOfPacket = 500;
-    //TODO assumption: return value is in bytes
-    size_t inputBufSize = s->window_size - buffer_size(s->send_buffer);
+    // before rel_destoy: EOF send, EOF received, send_buffer empty, output_buffer empty
 
-    // check if buffer has enough cap for new packets
-    if (inputBufSize <= 0)
+    while (s->window_size > 0 || !s->send_EOF)
     {
-        fprintf(stderr, "error: buf has not enough space\n");
-        return;
-    }
-
-    // read data from stdin in bytes
-    void *buf = xmalloc(inputBufSize);
-    int d = conn_input(s->c, buf, inputBufSize);
-    if (d == 0) // no data currently available
-    {
-        free(buf);
-        fprintf(stderr, "error: not data available to read\n");
-        return;
-    }
-    // read an EOF or error from input and ALL packets sent are acknowledged
-    // TODO add other termination constraints
-    else if (d == -1 && s->send_unack == s->send_next)
-    {
-        free(buf);
-        rel_destroy(s);
-    }
-
-    // integer div to get how many packets we have
-    // check if remaining bytes with mod; possible small packet
-    int number_packets = d / maxSizeOfPacket;
-    int extra_packet_size = 0;
-    if (d % maxSizeOfPacket != 0)
-    {
-        number_packets++;
-        extra_packet_size = d % maxSizeOfPacket;
-    }
-
-    // split and prepend for each packet a header and put into buffer
-    // TODO ACK is 0 here ?
-    unsigned char *ptr = (unsigned char *)buf;
-    for (int i = 0; i < number_packets - 1; i++)
-    {
-        char data[maxSizeOfPacket];
-        for (int j = 0; j < maxSizeOfPacket; j++)
+        // get data from stdin
+        char *buf = xmalloc(500);
+        int data_size = conn_input(s->c, buf, 500);
+        if (data_size == 0) // no data currently available
         {
-            data[j] = ptr[i * maxSizeOfPacket + j];
+            free(buf);
+            fprintf(stderr, "error: no data available to read\n");
+            return;
         }
-        packet_t packet = {htons(0),
-                           htons(maxSizeOfPacket),
-                           htonl((uint16_t)0),
-                           htonl(s->current_seq_no),
-                           data};
-        packet.cksum = cksum(&packet, maxSizeOfPacket + 12);
-
-        packet_t *p = &packet;
-        s->current_seq_no++;
-        buffer_insert(s->send_buffer, p, 0);
-    }
-
-    // same for extra packet (smaller than 500 b)
-    if (extra_packet_size != 0)
-    {
-        char data[extra_packet_size];
-        for (int j = 0; j < extra_packet_size; j++)
+        else if (data_size == -1) // EOF
         {
-            data[j] = ptr[(number_packets - 1) * maxSizeOfPacket + j];
+            free(buf);
+            // TODO send EOF
+            fprintf(stderr, "info: send EOF\n");
+            return;
         }
-        packet_t packet = {htons(0),
-                           htons(extra_packet_size),
-                           htonl(0),
-                           htonl(s->current_seq_no),
-                           data};
-        packet.cksum = cksum(&packet, extra_packet_size + 12);
 
-        packet_t *p = &packet;
+        // create packet with header
+        packet_t *p = xmalloc(sizeof(packet_t));
+        p->cksum = htons(0);
+        p->len = htons(data_size);
+        p->ackno = htonl(0);
+        p->seqno = htonl(s->current_seq_no);
+        for (int i = 0; i < data_size; i++)
+        {
+            p->data[i] = buf[i];
+        }
+
+        free(buf);
+        buf = NULL;
+
+        // calc checksum (already in network order)
+        p->cksum = cksum(p, data_size + 12);
+
+        // send packet
+        int e = conn_sendpkt(s->c, p, data_size + 12);
+        if (e == -1 || e != data_size + 12)
+        {
+            fprintf(stderr, "error: could not send pkg\n");
+            return;
+        }
+
+        // update state
+        buffer_insert(s->send_buffer, p, getCurrentTime());
+        s->window_size--;
         s->current_seq_no++;
-        buffer_insert(s->send_buffer, p, 0);
+        fprintf(stderr, "info: packet sent\n");
     }
-    free(buf);
-    ptr = NULL;
-    buf = NULL;
-
-    // set send_next, but only on first run
-    if (s->current_seq_no == 2)
-    {
-        s->send_next = buffer_get_first(s->send_buffer);
-        s->send_unack = buffer_get_first(s->send_buffer);
-    }
-
-    // check if window is at max size
-    if (s->send_next - s->send_unack >= s->window_size)
-    {
-        fprintf(stderr, "error: window size is at max\n");
-        return;
-    }
-
-    //get current time
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
-
-    // send next packet
-    packet_t *packet = &s->send_next->packet;
-    int e = conn_sendpkt(s->c, packet, ntohs(packet->len) + 12);
-    if (e == -1 || e != ntohs(packet->len) + 12)
-    {
-        fprintf(stderr, "error: could not send pkg\n");
-        return;
-    }
-
-    //set last retransmit of packet to now and update send_next
-    s->send_next->last_retransmit = now_ms;
-    s->send_next = s->send_next->next;
-    fprintf(stderr, "packet sent\n");
+    fprintf(stderr, "info: window full or EOF read\n");
     return;
 }
 
