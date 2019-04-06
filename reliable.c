@@ -31,14 +31,11 @@ struct reliable_state
     uint64_t window_max_size;
     uint64_t window_size;
     uint64_t retransmission_timer;
-    uint32_t current_seq_no;
 
+    uint32_t current_seq_no;
     uint32_t current_ack_no;
 
-    buffer_node_t *send_unack;
-    buffer_node_t *send_next;
-
-    buffer_node_t *recv_next;
+    uint32_t current_expt_seq_no;
 
     int send_EOF;
     int recv_EOF;
@@ -84,13 +81,11 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_com
     r->window_size = 0;
 
     r->retransmission_timer = cc->timeout;
+
     r->current_seq_no = 1;
-
-    r->send_next = r->send_buffer->head;
-    r->send_unack = r->send_buffer->head;
-
-    r->recv_next = r->rec_buffer->head;
     r->current_ack_no = 1;
+
+    r->current_expt_seq_no = 1;
 
     return r;
 }
@@ -181,7 +176,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 
     // drop packet if out of window
     uint32_t seqno = ntohl(pkt->seqno);
-    if (r->current_ack_no != 1 && seqno >= r->recv_next->packet.seqno + r->window_size)
+    if (seqno < r->current_expt_seq_no || r->current_expt_seq_no + r->window_max_size <= seqno)
     {
         fprintf(stderr, "error: received packet is out of window\n");
         return;
@@ -191,25 +186,19 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     if (!buffer_contains(r->rec_buffer, seqno))
     {
         buffer_insert(r->rec_buffer, pkt, 0);
-        // set send_next, but only on first run
-        if (r->current_ack_no == 1)
-        {
-            r->recv_next = buffer_get_first(r->rec_buffer);
-        }
     }
 
     //set recv_next to highest seqno consecutively stored in the buffer + 1
-    if (seqno == ntohl(r->recv_next->packet.seqno))
+    buffer_node_t *current = buffer_get_first(r->rec_buffer);
+    if (seqno == ntohl(r->current_expt_seq_no))
     {
         int max_seqno = seqno;
-        buffer_node_t *current = r->recv_next->next;
         while (current != NULL && ntohl(current->packet.seqno) == max_seqno + 1)
         {
             max_seqno = ntohl((current->packet.seqno));
             current = current->next;
         }
-        r->recv_next = current;
-        r->current_ack_no = max_seqno;
+        r->current_expt_seq_no = current->packet.seqno;
     }
 
     // Release data [seqno, RCV.NXT - 1] with rel_output() TODO
@@ -293,17 +282,8 @@ void rel_read(rel_t *s)
 
 void rel_output(rel_t *r)
 {
-    // check if bufspace is enough for taking next package
-    // TODO is the buffersize check necessary again here ?
-    size_t space = conn_bufspace(r->c);
-    size_t len = ntohs(buffer_get_first(r->rec_buffer)->packet.len);
-    if (space < len)
-    {
-        return;
-    }
-
-    // char *buf = xmalloc(len);
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
+    size_t len = ntohs(node->packet.len);
     void *buf = &node->packet.data;
 
     int e = buffer_remove_first(r->rec_buffer);
@@ -319,7 +299,6 @@ void rel_output(rel_t *r)
         fprintf(stderr, "error: could not send pkg\n");
         return;
     }
-    // free(buf);
     buf = NULL;
 
     return;
@@ -332,17 +311,13 @@ void rel_timer()
     rel_t *current = rel_list;
     while (current != NULL)
     {
-        buffer_node_t *current_node = current->send_unack;
-        buffer_node_t *send_next = current->send_next;
+        buffer_node_t *current_node = buffer_get_first(current->send_buffer);
         uint64_t retransmission_timer = current->retransmission_timer;
 
-        //get current time
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+        long now_ms = getCurrentTime();
 
-        // go over window
-        while (current_node != send_next)
+        // go over window (alternatively go over window size)
+        while (current_node != NULL)
         {
             if (now_ms - current_node->last_retransmit > retransmission_timer)
             {
