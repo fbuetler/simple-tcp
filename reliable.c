@@ -144,10 +144,11 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     // ACK PACKET
     if (n == 8)
     {
-        //r->current_ack_no++;
-        int w = buffer_remove(r->send_buffer, ackno); // ackno should be equal to seqno of first packet in buffer ?
+        int w = buffer_remove(r->send_buffer, ackno);
         r->window_size -= w;
-        fprintf(stderr, "info: ack received\n");
+        fprintf(stderr, "info sender: ack received %d\n", ackno);
+        fprintf(stderr, "info sender: window size decreased by %d, now is %ld\n", w, r->window_size);
+        rel_read(r);
         return;
     }
 
@@ -158,7 +159,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         // check if all receivec packets are written to stdout
         // wait for out of order packets
         // then rel_destroy()
-        fprintf(stderr, "info: end of connection packet\n");
+        fprintf(stderr, "info receiver: end of file packet\n");
         rel_output(r);
         return;
     }
@@ -179,11 +180,13 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         buffer_insert(r->recv_buffer, pkt, 0);
     }
 
+    fprintf(stderr, "info receiver: got pkt %d\n", seqno);
+
     // Release data [seqno, RCV.NXT - 1] with rel_output() TODO
-    // if (seqno == r->current_ack_no)
-    // {
-    rel_output(r);
-    // }
+    if (seqno == r->current_ack_no)
+    {
+        rel_output(r);
+    }
 
     // Send back ACK with cumulative ackno = RCV.NXT
     if (!r->outputBufferFull)
@@ -200,13 +203,13 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
             fprintf(stderr, "error: could not send ack\n");
             return;
         }
-        fprintf(stderr, "\ninfo: ack sent\n");
+        fprintf(stderr, "info receiver: sent ack %d\n", ackno);
     }
 }
 
 void rel_read(rel_t *s)
 {
-    while (s->window_size < s->window_max_size || !s->send_EOF)
+    while (s->window_size < s->window_max_size && !s->send_EOF)
     {
         // get data from stdin
         char *buf = xmalloc(500);
@@ -214,7 +217,7 @@ void rel_read(rel_t *s)
         if (data_size == 0) // no data currently available
         {
             free(buf);
-            fprintf(stderr, "info: no data available to read\n");
+            // fprintf(stderr, "info: no data available to read\n");
             return;
         }
         else if (data_size == -1) // EOF
@@ -241,7 +244,7 @@ void rel_read(rel_t *s)
 
             free(buf);
             buf = NULL;
-            fprintf(stderr, "info: send EOF\n");
+            fprintf(stderr, "info sender: send EOF\n");
             return;
         }
 
@@ -273,16 +276,20 @@ void rel_read(rel_t *s)
         // update state
         buffer_insert(s->send_buffer, p, getCurrentTime());
         s->window_size++;
+        fprintf(stderr, "info sender: window size increased, now is %ld and sent pkt % d\n", s->window_size, s->current_seq_no);
         s->current_seq_no++;
-        fprintf(stderr, "info: packet sent\n");
     }
-    fprintf(stderr, "info: window full or EOF read\n");
+    fprintf(stderr, "info sender: window full or EOF read\n");
     return;
 }
 
 void rel_output(rel_t *r)
 {
     buffer_node_t *node = buffer_get_first(r->recv_buffer);
+    if (node == NULL)
+    {
+        return;
+    }
     size_t len = ntohs(node->packet.len) - 12;
     void *buf = &node->packet.data;
 
@@ -309,6 +316,12 @@ void rel_output(rel_t *r)
     else
     {
         r->outputBufferFull = 1;
+    }
+
+    // write EOG to STDOUT
+    if (r->recv_EOF && buffer_size(r->recv_buffer) == 0)
+    {
+        conn_output(r->c, buf, 0);
     }
 
     return;
@@ -348,7 +361,10 @@ void rel_timer()
         {
             rel_destroy(current);
             fprintf(stderr, "info: connection destroyed\n");
+            return;
         }
+        current = rel_list->next;
     }
-    current = rel_list->next;
+
+    return;
 }
