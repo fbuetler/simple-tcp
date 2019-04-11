@@ -23,13 +23,11 @@ struct reliable_state
     conn_t *c; /* This is the connection object */
 
     /* Add your own data fields below this */
-    // ...
     buffer_t *send_buffer;
-    // ...
     buffer_t *recv_buffer;
 
     uint64_t window_max_size;
-    uint64_t window_size;
+    uint64_t window_size; // semantically equal to buffer_size(r->send_buffer)
     uint64_t retransmission_timer;
 
     uint32_t current_seq_no;
@@ -253,7 +251,10 @@ void rel_read(rel_t *s)
         p->len = htons(data_size + 12);
         p->ackno = htonl(0); // TODO possibly piggy pack ACKs
         p->seqno = htonl(s->current_seq_no);
-        p->data[0] = *buf;
+        for (int i = 0; i < data_size; i++)
+        {
+            p->data[i] = buf[i];
+        }
 
         free(buf);
         buf = NULL;
@@ -348,7 +349,6 @@ void rel_timer()
             rel_destroy(current);
             fprintf(stderr, "info: connection destroyed\n");
         }
-
-        current = rel_list->next;
     }
+    current = rel_list->next;
 }
