@@ -114,6 +114,26 @@ void rel_destroy(rel_t *r)
     // ...
 }
 
+void send_ack(rel_t *r)
+{
+    if (!r->outputBufferFull)
+    {
+        uint32_t ackno = r->current_ack_no;
+        struct ack_packet ack_pkt = {htons(0), htons(8), htonl(ackno)};
+        ack_pkt.cksum = cksum(&ack_pkt, 8);
+
+        packet_t *ack = (packet_t *)&ack_pkt;
+
+        int e = conn_sendpkt(r->c, ack, 8);
+        if (e == -1 || e != 8)
+        {
+            fprintf(stderr, "error: could not send ack\n");
+            return;
+        }
+        print_pkt(ack, "recevier: send ack", 8);
+    }
+}
+
 // n is the length of the pkt
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 {
@@ -183,26 +203,6 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     send_ack(r);
 }
 
-void send_ack(rel_t *r)
-{
-    if (!r->outputBufferFull)
-    {
-        uint32_t ackno = r->current_ack_no;
-        struct ack_packet ack_pkt = {htons(0), htons(8), htonl(ackno)};
-        ack_pkt.cksum = cksum(&ack_pkt, 8);
-
-        packet_t *ack = (packet_t *)&ack_pkt;
-
-        int e = conn_sendpkt(r->c, ack, 8);
-        if (e == -1 || e != 8)
-        {
-            fprintf(stderr, "error: could not send ack\n");
-            return;
-        }
-        print_pkt(ack, "recevier: send ack", 8);
-    }
-}
-
 void rel_read(rel_t *s)
 {
     while (s->window_size < s->window_max_size && !s->send_EOF)
@@ -221,7 +221,7 @@ void rel_read(rel_t *s)
             packet_t *p = xmalloc(sizeof(packet_t));
             p->cksum = htons(0);
             p->len = htons(12);
-            p->ackno = htonl(0); // TODO possibly piggy pack ACKs
+            p->ackno = htonl(s->current_ack_no); // TODO possibly piggy pack ACKs
             p->seqno = htonl(s->current_seq_no);
 
             // calc checksum (already in network order)
@@ -248,7 +248,7 @@ void rel_read(rel_t *s)
         packet_t *p = xmalloc(sizeof(packet_t));
         p->cksum = htons(0);
         p->len = htons(data_size + 12);
-        p->ackno = htonl(0); // TODO possibly piggy pack ACKs
+        p->ackno = htonl(s->current_ack_no); // TODO possibly piggy pack ACKs
         p->seqno = htonl(s->current_seq_no);
         for (int i = 0; i < data_size; i++)
         {
@@ -335,11 +335,10 @@ void rel_timer()
         buffer_node_t *current_node = buffer_get_first(current->send_buffer);
         uint64_t retransmission_timer = current->retransmission_timer;
 
-        long now_ms = getCurrentTime();
-
         // go over window (alternatively go over window size)
         while (current_node != NULL)
         {
+            long now_ms = getCurrentTime();
             if (now_ms - current_node->last_retransmit > retransmission_timer)
             {
                 // retransmit packet
