@@ -139,12 +139,10 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
         return;
     }
 
-    uint32_t ackno = ntohl(pkt->ackno);
-
     // ACK PACKET
     if (n == 8)
     {
-        int w = buffer_remove(r->send_buffer, ackno);
+        int w = buffer_remove(r->send_buffer, ntohl(pkt->ackno));
         r->window_size -= w;
         print_pkt(pkt, "sender: got ack", 8);
         rel_read(r);
@@ -155,7 +153,8 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     uint32_t seqno = ntohl(pkt->seqno);
     if (seqno < r->current_ack_no || r->current_ack_no + r->window_max_size <= seqno)
     {
-        fprintf(stderr, "error: received packet is out of window\n");
+        print_pkt(pkt, "receiver: got pkt out of window", n);
+        send_ack(r);
         return;
     }
 
@@ -185,9 +184,14 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     }
 
     // Send back ACK with cumulative ackno = RCV.NXT
+    send_ack(r);
+}
+
+void send_ack(rel_t *r)
+{
     if (!r->outputBufferFull)
     {
-        ackno = r->current_ack_no;
+        uint32_t ackno = r->current_ack_no;
         struct ack_packet ack_pkt = {htons(0), htons(8), htonl(ackno)};
         ack_pkt.cksum = cksum(&ack_pkt, 8);
 
