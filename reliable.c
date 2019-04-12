@@ -33,8 +33,6 @@ struct reliable_state
     uint32_t current_seq_no;
     uint32_t current_ack_no;
 
-    uint32_t current_expt_seq_no;
-
     int outputBufferFull;
     int send_EOF;
     int recv_EOF;
@@ -83,8 +81,6 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_com
 
     r->current_seq_no = 1;
     r->current_ack_no = 1;
-
-    r->current_expt_seq_no = 1;
 
     r->outputBufferFull = 0;
     r->send_EOF = 0;
@@ -349,7 +345,7 @@ void rel_timer()
                 // retransmit packet
                 packet_t *packet = &current_node->packet;
                 int e = conn_sendpkt(current->c, packet, ntohs(packet->len));
-                if (e == -1 || e != packet->len)
+                if (e == -1 || e != ntohs(packet->len))
                 {
                     return; // TODO what else ?
                 }
