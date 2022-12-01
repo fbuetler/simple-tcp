@@ -1,22 +1,21 @@
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stddef.h>
 #include <assert.h>
-#include <poll.h>
 #include <errno.h>
-#include <time.h>
-#include <sys/time.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "rlib.h"
 #include "buffer.h"
+#include "rlib.h"
 
-struct reliable_state
-{
+struct reliable_state {
     rel_t *next; /* Linked list for traversing all connections */
     rel_t **prev;
 
@@ -27,7 +26,7 @@ struct reliable_state
     buffer_t *recv_buffer;
 
     uint64_t window_max_size;
-    uint64_t window_size; // semantically equal to buffer_size(r->send_buffer)
+    uint64_t window_size;  // semantically equal to buffer_size(r->send_buffer)
     uint64_t retransmission_timer;
 
     uint32_t current_seq_no;
@@ -40,20 +39,17 @@ struct reliable_state
 rel_t *rel_list;
 
 /* Creates a new reliable protocol session, returns NULL on failure.
-* ss is always NULL */
+ * ss is always NULL */
 rel_t *
-rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_common *cc)
-{
+rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_common *cc) {
     rel_t *r;
 
     r = xmalloc(sizeof(*r));
     memset(r, 0, sizeof(*r));
 
-    if (!c)
-    {
+    if (!c) {
         c = conn_create(r, ss);
-        if (!c)
-        {
+        if (!c) {
             free(r);
             return NULL;
         }
@@ -89,18 +85,15 @@ rel_create(conn_t *c, const struct sockaddr_storage *ss, const struct config_com
     return r;
 }
 
-long getCurrentTime()
-{
+long getCurrentTime() {
     struct timeval now;
     gettimeofday(&now, NULL);
     long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
     return now_ms;
 }
 
-void rel_destroy(rel_t *r)
-{
-    if (r->next)
-    {
+void rel_destroy(rel_t *r) {
+    if (r->next) {
         r->next->prev = r->prev;
     }
     *r->prev = r->next;
@@ -114,10 +107,8 @@ void rel_destroy(rel_t *r)
     // ...
 }
 
-void send_ack(rel_t *r)
-{
-    if (!r->outputBufferFull)
-    {
+void send_ack(rel_t *r) {
+    if (!r->outputBufferFull) {
         uint32_t ackno = r->current_ack_no;
         struct ack_packet ack_pkt = {htons(0), htons(8), htonl(ackno)};
         ack_pkt.cksum = cksum(&ack_pkt, 8);
@@ -125,8 +116,7 @@ void send_ack(rel_t *r)
         packet_t *ack = (packet_t *)&ack_pkt;
 
         int e = conn_sendpkt(r->c, ack, 8);
-        if (e == -1 || e != 8)
-        {
+        if (e == -1 || e != 8) {
             fprintf(stderr, "error: could not send ack\n");
             return;
         }
@@ -135,12 +125,10 @@ void send_ack(rel_t *r)
 }
 
 // n is the length of the pkt
-void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
-{
+void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     // catch impossible packets
     uint16_t len = ntohs(pkt->len);
-    if ((n != 8 && n < 12) || len != (uint16_t)n)
-    {
+    if ((n != 8 && n < 12) || len != (uint16_t)n) {
         fprintf(stderr, "error: impossible packet size\n");
         return;
     }
@@ -148,16 +136,14 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     uint16_t checksum = pkt->cksum;
     pkt->cksum = htons(0);
 
-    //catch corrupted packets
-    if (cksum(pkt, n) != checksum)
-    {
+    // catch corrupted packets
+    if (cksum(pkt, n) != checksum) {
         fprintf(stderr, "error: corrupted paket\n");
         return;
     }
 
     // ACK PACKET
-    if (n == 8)
-    {
+    if (n == 8) {
         int w = buffer_remove(r->send_buffer, ntohl(pkt->ackno));
         r->window_size -= w;
         print_pkt(pkt, "sender: got ack", 8);
@@ -167,35 +153,29 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
 
     // drop packet if out of window
     uint32_t seqno = ntohl(pkt->seqno);
-    if (seqno < r->current_ack_no || r->current_ack_no + r->window_max_size <= seqno)
-    {
+    if (seqno < r->current_ack_no || r->current_ack_no + r->window_max_size <= seqno) {
         print_pkt(pkt, "receiver: got pkt out of window", n);
         send_ack(r);
         return;
     }
 
     // Store in the buffer if not already there
-    if (!buffer_contains(r->recv_buffer, seqno))
-    {
+    if (!buffer_contains(r->recv_buffer, seqno)) {
         buffer_insert(r->recv_buffer, pkt, 0);
     }
 
     // EOF PACKET
-    if (n == 12)
-    {
+    if (n == 12) {
         r->recv_EOF = 1;
         print_pkt(pkt, "receiver: got EOF", 12);
-    }
-    else
-    {
+    } else {
         print_pkt(pkt, "receiver: got packet", n);
     }
 
     // NORMAL DATA PACKET
 
-    // Release data [seqno, RCV.NXT - 1] with rel_output() TODO
-    if (seqno == r->current_ack_no)
-    {
+    // Release data [seqno, RCV.NXT - 1] with rel_output()
+    if (seqno == r->current_ack_no) {
         rel_output(r);
     }
 
@@ -203,25 +183,22 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n)
     send_ack(r);
 }
 
-void rel_read(rel_t *s)
-{
-    while (s->window_size < s->window_max_size && !s->send_EOF)
-    {
+void rel_read(rel_t *s) {
+    while (s->window_size < s->window_max_size && !s->send_EOF) {
         // get data from stdin
         char *buf = xmalloc(500);
         int data_size = conn_input(s->c, buf, 500);
-        if (data_size == 0) // no data currently available
+        if (data_size == 0)  // no data currently available
         {
             free(buf);
             return;
-        }
-        else if (data_size == -1) // EOF
+        } else if (data_size == -1)  // EOF
         {
             // create packet with header
             packet_t *p = xmalloc(sizeof(packet_t));
             p->cksum = htons(0);
             p->len = htons(12);
-            p->ackno = htonl(s->current_ack_no); // TODO possibly piggy pack ACKs
+            p->ackno = htonl(s->current_ack_no);
             p->seqno = htonl(s->current_seq_no);
 
             // calc checksum (already in network order)
@@ -229,8 +206,7 @@ void rel_read(rel_t *s)
 
             // send packet
             int e = conn_sendpkt(s->c, p, 12);
-            if (e == -1 || e != 12)
-            {
+            if (e == -1 || e != 12) {
                 fprintf(stderr, "error: could not send pkg\n");
                 return;
             }
@@ -248,10 +224,9 @@ void rel_read(rel_t *s)
         packet_t *p = xmalloc(sizeof(packet_t));
         p->cksum = htons(0);
         p->len = htons(data_size + 12);
-        p->ackno = htonl(s->current_ack_no); // TODO possibly piggy pack ACKs
+        p->ackno = htonl(s->current_ack_no);
         p->seqno = htonl(s->current_seq_no);
-        for (int i = 0; i < data_size; i++)
-        {
+        for (int i = 0; i < data_size; i++) {
             p->data[i] = buf[i];
         }
 
@@ -263,8 +238,7 @@ void rel_read(rel_t *s)
 
         // send packet
         int e = conn_sendpkt(s->c, p, data_size + 12);
-        if (e == -1 || e != data_size + 12)
-        {
+        if (e == -1 || e != data_size + 12) {
             fprintf(stderr, "error: could not send pkg\n");
             return;
         }
@@ -275,34 +249,26 @@ void rel_read(rel_t *s)
         s->current_seq_no++;
         print_pkt(p, "sender: send pkt", data_size + 12);
     }
-    if (s->window_size >= s->window_max_size)
-    {
+    if (s->window_size >= s->window_max_size) {
         fprintf(stderr, "info sender: window full\n");
-    }
-    else
-    {
+    } else {
         fprintf(stderr, "info sender: EOF read\n");
     }
     return;
 }
 
-void rel_output(rel_t *r)
-{
+void rel_output(rel_t *r) {
     buffer_node_t *node = buffer_get_first(r->recv_buffer);
-    if (node == NULL)
-    {
+    if (node == NULL) {
         return;
     }
     size_t data_size = ntohs(node->packet.len) - 12;
     void *buf = &node->packet.data;
 
     // check if output_buf has space
-    if (data_size <= conn_bufspace(r->c))
-    {
-
+    if (data_size <= conn_bufspace(r->c)) {
         int e = conn_output(r->c, buf, data_size);
-        if (e == -1 || e != data_size)
-        {
+        if (e == -1 || e != data_size) {
             fprintf(stderr, "error: could not send pkg\n");
             return;
         }
@@ -310,43 +276,35 @@ void rel_output(rel_t *r)
         buf = NULL;
 
         e = buffer_remove_first(r->recv_buffer);
-        if (e != 0)
-        {
+        if (e != 0) {
             fprintf(stderr, "error: could not remove node form buffer\n");
             return;
         }
         r->outputBufferFull = 0;
-    }
-    else
-    {
+    } else {
         r->outputBufferFull = 1;
     }
 
     return;
 }
 
-void rel_timer()
-{
+void rel_timer() {
     // Go over all reliable senders, and have them send out
     // all packets whose timer has expired
     rel_t *current = rel_list;
-    while (current != NULL)
-    {
+    while (current != NULL) {
         buffer_node_t *current_node = buffer_get_first(current->send_buffer);
         uint64_t retransmission_timer = current->retransmission_timer;
 
         // go over window (alternatively go over window size)
-        while (current_node != NULL)
-        {
+        while (current_node != NULL) {
             long now_ms = getCurrentTime();
-            if (now_ms - current_node->last_retransmit > retransmission_timer)
-            {
+            if (now_ms - current_node->last_retransmit > retransmission_timer) {
                 // retransmit packet
                 packet_t *packet = &current_node->packet;
                 int e = conn_sendpkt(current->c, packet, ntohs(packet->len));
-                if (e == -1 || e != ntohs(packet->len))
-                {
-                    return; // TODO what else ?
+                if (e == -1 || e != ntohs(packet->len)) {
+                    return;  // TODO what else ?
                 }
                 current_node->last_retransmit = now_ms;
             }
@@ -354,8 +312,7 @@ void rel_timer()
         }
 
         // before rel_destoy: EOF send, EOF received, send_buffer empty, output_buffer empty
-        if (buffer_size(current->send_buffer) == 0 && buffer_size(current->recv_buffer) == 0 && current->send_EOF && current->recv_EOF)
-        {
+        if (buffer_size(current->send_buffer) == 0 && buffer_size(current->recv_buffer) == 0 && current->send_EOF && current->recv_EOF) {
             rel_destroy(current);
             fprintf(stderr, "info: connection destroyed\n");
             return;
